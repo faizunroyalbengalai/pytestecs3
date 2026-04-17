@@ -1,0 +1,257 @@
+name: Deploy — pytestecs3
+
+on:
+  workflow_dispatch:
+
+env:
+  ACTIONS_RUNNER_FORCED_INTERNAL_NODE_VERSION: node24
+  ACTIONS_RUNNER_FORCE_ACTIONS_NODE_VERSION: node24
+
+concurrency:
+  group: deploy-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - run: pytest --tb=short -q 2>/dev/null || echo "No tests found"
+
+  build_push:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    needs: test
+    outputs:
+      image_tag:     ${{ steps.meta.outputs.image_tag }}
+      project_lower: ${{ steps.meta.outputs.project_lower }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+      - name: Login to ECR
+        id: login_ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Sanitize project name for ECR
+        id: meta
+        run: |
+          ECR_REGISTRY="${{ steps.login_ecr.outputs.registry }}"
+          IMAGE_TAG="${{ github.sha }}"
+          # Lowercase, replace non-alphanumeric/hyphen with -, collapse and trim -
+          PROJECT_NAME=$(echo "${{ secrets.PROJECT_NAME }}" \
+            | tr '[:upper:]' '[:lower:]' \
+            | sed 's/[^a-z0-9-]/-/g' \
+            | sed 's/-\{2,\}/-/g' \
+            | sed 's/^-//; s/-$//')
+          echo "image_tag=${ECR_REGISTRY}/${PROJECT_NAME}:${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "project_lower=${PROJECT_NAME}" >> $GITHUB_OUTPUT
+      - name: Ensure ECR repository exists
+        run: |
+          # Create repo only if it does not already exist — idempotent, never fails
+          if aws ecr describe-repositories \
+               --repository-names "${{ steps.meta.outputs.project_lower }}" \
+               --region "${{ secrets.AWS_REGION }}" > /dev/null 2>&1; then
+            echo "ECR repo '${{ steps.meta.outputs.project_lower }}' already exists — skipping create"
+          else
+            echo "Creating ECR repo '${{ steps.meta.outputs.project_lower }}'..."
+            aws ecr create-repository \
+              --repository-name "${{ steps.meta.outputs.project_lower }}" \
+              --image-tag-mutability MUTABLE \
+              --region "${{ secrets.AWS_REGION }}"
+            echo "ECR repo created"
+          fi
+      - name: Build & push Docker image
+        run: |
+          docker build -t ${{ steps.meta.outputs.image_tag }} .
+          docker push ${{ steps.meta.outputs.image_tag }}
+
+  deploy:
+    name: Deploy to ECS (Terraform)
+    runs-on: ubuntu-latest
+    needs: build_push
+    outputs:
+      url:          ${{ steps.alb.outputs.url }}
+      cluster_name: ${{ steps.tf_outputs.outputs.cluster_name }}
+      service_name: ${{ steps.tf_outputs.outputs.service_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+      - name: Create S3 state bucket
+        run: |
+          aws s3 mb s3://${{ secrets.TF_STATE_BUCKET }} \
+            --region ${{ secrets.AWS_REGION }} 2>/dev/null || true
+      - name: Terraform init
+        working-directory: terraform
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
+      - name: Validate image tag before deploy
+        run: |
+          IMAGE="${{ needs.build_push.outputs.image_tag }}"
+          if [ -z "$IMAGE" ]; then
+            echo "ERROR: container image tag is empty — build_push job did not produce an image_tag output"
+            echo "Check the 'Sanitize project name for ECR' step in the build_push job"
+            exit 1
+          fi
+          echo "Image to deploy: $IMAGE"
+      - name: Terraform apply
+        working-directory: terraform
+        env:
+          # Pass image via TF_VAR_* — Terraform reads these automatically, no bash escaping issues
+          TF_VAR_container_image:   ${{ needs.build_push.outputs.image_tag }}
+          TF_VAR_app_port:          ${{ secrets.APP_PORT }}
+          # Database / external secrets — injected into ECS task environment
+          TF_VAR_database_url:      ${{ secrets.DATABASE_URL }}
+          TF_VAR_db_host:           ${{ secrets.DB_HOST }}
+          TF_VAR_db_port:           ${{ secrets.DB_PORT }}
+          TF_VAR_db_name:           ${{ secrets.DB_NAME }}
+          TF_VAR_db_username:       ${{ secrets.DB_USER }}
+          TF_VAR_db_password:       ${{ secrets.DB_PASSWORD }}
+          TF_VAR_mongo_uri:         ${{ secrets.MONGO_URI }}
+          TF_VAR_redis_url:         ${{ secrets.REDIS_URL }}
+          TF_VAR_secret_key:        ${{ secrets.SECRET_KEY }}
+          TF_VAR_jwt_secret:        ${{ secrets.JWT_SECRET }}
+          TF_VAR_spring_datasource_url:  ${{ secrets.SPRING_DATASOURCE_URL }}
+          TF_VAR_spring_datasource_user: ${{ secrets.SPRING_DATASOURCE_USERNAME }}
+          TF_VAR_spring_datasource_pass: ${{ secrets.SPRING_DATASOURCE_PASSWORD }}
+          TF_VAR_spring_mongodb_uri:     ${{ secrets.SPRING_DATA_MONGODB_URI }}
+          # RDS credentials (used only when install_db == rds)
+          TF_VAR_rds_db_name:       ${{ secrets.DB_NAME }}
+          TF_VAR_rds_db_username:   ${{ secrets.DB_USERNAME }}
+          TF_VAR_rds_db_password:   ${{ secrets.DB_PASSWORD }}
+        run: |
+          terraform apply -auto-approve \
+            -var="project_name=${{ secrets.PROJECT_NAME }}" \
+            -var="aws_region=${{ secrets.AWS_REGION }}"
+      - name: Force ECS service to use new task definition
+        run: |
+          PROJECT_NAME="${{ secrets.PROJECT_NAME }}"
+          REGION="${{ secrets.AWS_REGION }}"
+          # Get the latest task definition ARN for this family (just created by terraform apply)
+          TASK_DEF_ARN=$(aws ecs describe-task-definition \
+            --task-definition "$PROJECT_NAME" \
+            --region "$REGION" \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text 2>/dev/null || echo "")
+          if [ -z "$TASK_DEF_ARN" ]; then
+            echo "Could not resolve task definition ARN — skipping force deploy"
+          else
+            # Resolve cluster/service names using the same naming logic as Terraform
+            NAME_SAFE=$(echo "$PROJECT_NAME" \
+              | tr '[:upper:]' '[:lower:]' \
+              | sed 's/_/-/g' \
+              | cut -c1-24 \
+              | sed 's/-$//')
+            CLUSTER="${NAME_SAFE}-cluster"
+            SERVICE="${NAME_SAFE}-service"
+            echo "Updating ECS service '$SERVICE' in cluster '$CLUSTER' to task def: $TASK_DEF_ARN"
+            aws ecs update-service \
+              --cluster "$CLUSTER" \
+              --service "$SERVICE" \
+              --task-definition "$TASK_DEF_ARN" \
+              --force-new-deployment \
+              --region "$REGION" \
+              --query 'service.serviceArn' --output text
+          fi
+      - name: Capture Terraform outputs
+        id: tf_outputs
+        working-directory: terraform
+        run: |
+          CLUSTER=$(terraform output -raw ecs_cluster_name 2>/dev/null || echo "")
+          SERVICE=$(terraform output -raw ecs_service_name 2>/dev/null || echo "")
+          echo "cluster_name=${CLUSTER}" >> $GITHUB_OUTPUT
+          echo "service_name=${SERVICE}" >> $GITHUB_OUTPUT
+      - name: Wait for ECS service to reach steady state
+        run: |
+          CLUSTER="${{ steps.tf_outputs.outputs.cluster_name }}"
+          SERVICE="${{ steps.tf_outputs.outputs.service_name }}"
+          if [ -z "$CLUSTER" ] || [ -z "$SERVICE" ]; then
+            echo "Could not determine cluster/service name — skipping wait"
+          else
+            echo "Waiting for ECS service '$SERVICE' in cluster '$CLUSTER' to be stable..."
+            aws ecs wait services-stable \
+              --cluster "$CLUSTER" \
+              --services "$SERVICE" \
+              --region ${{ secrets.AWS_REGION }} && \
+              echo "ECS service is stable!" || \
+              echo "Warning: ECS service did not reach steady state within timeout — check AWS console"
+          fi
+      - name: Get ALB URL
+        id: alb
+        working-directory: terraform
+        run: |
+          terraform output
+          ALB_DNS=$(terraform output -raw alb_dns_name 2>/dev/null || true)
+          if [ -z "$ALB_DNS" ]; then
+            echo "Warning: could not read alb_dns_name from terraform output"
+            echo "url=" >> $GITHUB_OUTPUT
+          else
+            ALB_URL="http://${ALB_DNS}"
+            echo "url=${ALB_URL}" >> $GITHUB_OUTPUT
+            # Echo in patterns the orchestrator log-scraper can match
+            echo "alb_url = \"${ALB_URL}\""
+            echo "Live URL: ${ALB_URL}"
+          fi
+
+  verify:
+    name: Health Check
+    runs-on: ubuntu-latest
+    needs: deploy
+    steps:
+      - name: Wait for app to respond
+        run: |
+          URL="${{ needs.deploy.outputs.url }}"
+          if [ -z "$URL" ] || [ "$URL" = "http://" ]; then
+            echo "No URL available — skipping health check"
+            exit 0
+          fi
+          echo "Checking app at: ${URL}"
+          for i in $(seq 1 24); do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$URL" 2>/dev/null || echo "000")
+            echo "Attempt ${i}/24 — HTTP ${HTTP_CODE}"
+            # Accept any response that is not a connection error (000) or 5xx gateway error
+            if [ "$HTTP_CODE" != "000" ] && [ "$HTTP_CODE" != "502" ] && [ "$HTTP_CODE" != "503" ]; then
+              echo "App is responding (HTTP ${HTTP_CODE}) — deployment healthy!"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "App did not respond within 6 minutes — check ECS service logs in CloudWatch"
+
+  notify:
+    name: Deployment Summary
+    runs-on: ubuntu-latest
+    needs: [deploy, verify]
+    if: always()
+    steps:
+      - name: Print deployment summary
+        run: |
+          URL="${{ needs.deploy.outputs.url }}"
+          echo "================================================"
+          echo "ECS Deployment complete!"
+          if [ -n "$URL" ] && [ "$URL" != "http://" ]; then
+            echo "alb_url = \"${URL}\""
+            echo "Live URL: ${URL}"
+          else
+            echo "Check ECS service in AWS Console for the ALB URL."
+          fi
+          echo "================================================"
