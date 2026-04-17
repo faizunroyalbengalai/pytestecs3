@@ -43,11 +43,12 @@ jobs:
         uses: aws-actions/amazon-ecr-login@v2
       - name: Sanitize project name for ECR
         id: meta
+        env:
+          ECR_REGISTRY: ${{ steps.login_ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+          PROJECT_NAME_RAW: ${{ secrets.PROJECT_NAME }}
         run: |
-          ECR_REGISTRY="${{ steps.login_ecr.outputs.registry }}"
-          IMAGE_TAG="${{ github.sha }}"
-          # Lowercase, replace non-alphanumeric/hyphen with -, collapse and trim -
-          PROJECT_NAME=$(echo "${{ secrets.PROJECT_NAME }}" \
+          PROJECT_NAME=$(echo "$PROJECT_NAME_RAW" \
             | tr '[:upper:]' '[:lower:]' \
             | sed 's/[^a-z0-9-]/-/g' \
             | sed 's/-\{2,\}/-/g' \
@@ -198,60 +199,3 @@ jobs:
       - name: Get ALB URL
         id: alb
         working-directory: terraform
-        run: |
-          terraform output
-          ALB_DNS=$(terraform output -raw alb_dns_name 2>/dev/null || true)
-          if [ -z "$ALB_DNS" ]; then
-            echo "Warning: could not read alb_dns_name from terraform output"
-            echo "url=" >> $GITHUB_OUTPUT
-          else
-            ALB_URL="http://${ALB_DNS}"
-            echo "url=${ALB_URL}" >> $GITHUB_OUTPUT
-            # Echo in patterns the orchestrator log-scraper can match
-            echo "alb_url = \"${ALB_URL}\""
-            echo "Live URL: ${ALB_URL}"
-          fi
-
-  verify:
-    name: Health Check
-    runs-on: ubuntu-latest
-    needs: deploy
-    steps:
-      - name: Wait for app to respond
-        run: |
-          URL="${{ needs.deploy.outputs.url }}"
-          if [ -z "$URL" ] || [ "$URL" = "http://" ]; then
-            echo "No URL available — skipping health check"
-            exit 0
-          fi
-          echo "Checking app at: ${URL}"
-          for i in $(seq 1 24); do
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$URL" 2>/dev/null || echo "000")
-            echo "Attempt ${i}/24 — HTTP ${HTTP_CODE}"
-            # Accept any response that is not a connection error (000) or 5xx gateway error
-            if [ "$HTTP_CODE" != "000" ] && [ "$HTTP_CODE" != "502" ] && [ "$HTTP_CODE" != "503" ]; then
-              echo "App is responding (HTTP ${HTTP_CODE}) — deployment healthy!"
-              exit 0
-            fi
-            sleep 15
-          done
-          echo "App did not respond within 6 minutes — check ECS service logs in CloudWatch"
-
-  notify:
-    name: Deployment Summary
-    runs-on: ubuntu-latest
-    needs: [deploy, verify]
-    if: always()
-    steps:
-      - name: Print deployment summary
-        run: |
-          URL="${{ needs.deploy.outputs.url }}"
-          echo "================================================"
-          echo "ECS Deployment complete!"
-          if [ -n "$URL" ] && [ "$URL" != "http://" ]; then
-            echo "alb_url = \"${URL}\""
-            echo "Live URL: ${URL}"
-          else
-            echo "Check ECS service in AWS Console for the ALB URL."
-          fi
-          echo "================================================"
